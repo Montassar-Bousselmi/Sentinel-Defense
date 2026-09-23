@@ -1,8 +1,4 @@
-"""SENTINEL v1 API schemas.
-
-The request envelope remains lenient, while the action and response contracts stay strict.
-Do not change these evaluator-facing shapes unless the official simulator changes them.
-"""
+"""API schemas and data models."""
 
 from __future__ import annotations
 
@@ -14,12 +10,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_METADATA_BYTES = 4_096
 REASON_CODE_PATTERN = r"^[A-Z][A-Z0-9_]{1,63}$"
-
-# DoS backstops added on top of the original shapes. These are generous
-# (well above any legitimate scenario payload seen in the spec) so a
-# compliant simulator is unaffected; they exist only to bound the cost of
-# regex/base64 scanning and recursive digesting against a hostile or
-# malformed request. Field names/types are unchanged - only size is bounded.
 MAX_CONTENT_CHARS = 50_000
 MAX_LIST_ITEMS = 500
 MAX_CONFIRMATION_DEPTH = 6
@@ -40,14 +30,6 @@ class CandidateAction(BaseModel):
 
     @model_validator(mode="after")
     def _bounded_confirmation_depth(self) -> CandidateAction:
-        # `confirmation_for` is self-referential with no depth limit in the
-        # original schema. Pydantic will have already recursively parsed
-        # whatever nesting arrived, so this can't prevent a parse-time cost on
-        # an extreme payload, but it does reject moderate-to-deep nesting
-        # cleanly (422) instead of letting it flow into action_digest's own
-        # recursion or a confirmation-chain the decision engine wasn't
-        # designed to reason about. A reverse-proxy body-size limit is the
-        # right complementary control for the parse-time cost itself.
         depth = 0
         node = self.confirmation_for
         while node is not None:

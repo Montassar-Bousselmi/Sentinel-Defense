@@ -15,16 +15,6 @@ _API_KEY = os.getenv("SENTINEL_API_KEY")
 
 
 def require_api_key(authorization: str | None = Header(default=None)) -> None:
-    """Optional bearer-token gate.
-
-    The service previously had no authentication at all on any route,
-    including /v1/trace, which returns another run's full decision history
-    (risk scores, reason codes, tool names). Disabled by default (no
-    SENTINEL_API_KEY set) so an evaluator/simulator that calls this service
-    without credentials keeps working unchanged; set SENTINEL_API_KEY in any
-    real deployment to require `Authorization: Bearer <key>` on sensitive routes.
-    /healthz remains intentionally unauthenticated for container health checks.
-    """
     if _API_KEY is None:
         return
     if authorization != f"Bearer {_API_KEY}":
@@ -70,11 +60,7 @@ def healthz() -> dict[str, str]:
 def decision(request: DefenseRequest) -> DefenseDecision:
     rate_limiter.check(request.run_id)
     started = time.perf_counter()
-    # Passing trace_store lets the engine reconcile caller-reported history
-    # (blocked/escalated counts, least-trusted-seen, steps_taken) against the
-    # server's own record of this run_id instead of trusting it outright.
     result = decide(request, trace_store=trace_store)
-    # Keep latency visible without exposing input content.
     result.metadata["decision_latency_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
     trace_store.record(request, result)
     return result

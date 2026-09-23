@@ -42,11 +42,6 @@ class TraceStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _rotate_if_needed(self) -> None:
-        # The append-only trace file previously had no retention policy and
-        # would grow without bound for the life of the process. This keeps at
-        # most one prior generation on disk (path.1) rather than implementing
-        # full log management, which is enough to stop unbounded disk growth
-        # without adding an external dependency.
         if not self.path or not self.path.exists():
             return
         if self.path.stat().st_size < self.max_file_bytes:

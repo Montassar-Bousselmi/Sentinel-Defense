@@ -1,15 +1,4 @@
-"""Provenance-aware, stateful SENTINEL defense engine.
-
-Design goals derived from the SENTINEL specification:
-- decide only from agent state, candidate action, provenance, active policy, and observed content;
-- treat untrusted content as data/evidence, never as authority;
-- detect data-flow risk, indirect injection, multi-step influence, memory poisoning, and tampering;
-- preserve utility by allowing benign reads and rewriting some risky sends into drafts;
-- require confirmation for consequential operations;
-- expose concise, auditable reason codes without chain-of-thought.
-
-This module intentionally does not use scenario IDs, filenames, organizer labels, or expected outcomes.
-"""
+"""Defense decision engine."""
 
 from __future__ import annotations
 
@@ -61,7 +50,6 @@ HIGH_IMPACT_STATUS = {
     "completed",
 }
 
-# These are semantic capability labels, not scenario identifiers.
 TOOL_CAPABILITIES = {
     "send_email": {"communicate_external", "write_external"},
     "email_send": {"communicate_external", "write_external"},
@@ -105,9 +93,6 @@ EXTERNAL_DESTINATION_KEYS = {
     "external_recipient",
     "account",
     "account_id",
-    # Common exfiltration channels that were previously unchecked: an agent (or
-    # an injected instruction) can route data out just as effectively through
-    # cc/bcc or a webhook as through the primary "to" field.
     "cc",
     "bcc",
     "reply_to",
@@ -307,15 +292,6 @@ _CONFIRMATION_SECRET_ENV = "SENTINEL_CONFIRMATION_SECRET"
 
 
 def _confirmation_secret() -> bytes:
-    """Server-side key used to sign confirmation tickets.
-
-    SECURITY: this MUST be set via SENTINEL_CONFIRMATION_SECRET in any real
-    deployment. Falling back to a fixed string keeps the service from crashing
-    in local/dev use, but it means confirmation tokens are forgeable exactly
-    like the old plain-digest scheme whenever the env var is unset - this is a
-    deliberately loud footgun, not a safe default. Log/alert on startup if the
-    env var is missing.
-    """
     secret = os.getenv(_CONFIRMATION_SECRET_ENV)
     if not secret:
         secret = "INSECURE-DEV-ONLY-SET-" + _CONFIRMATION_SECRET_ENV
@@ -323,18 +299,6 @@ def _confirmation_secret() -> bytes:
 
 
 def confirmation_token(action: CandidateAction, run_id: str) -> str:
-    """Mint the ticket a caller must present to prove an action was actually confirmed.
-
-    This replaces using the plain `action_digest` as the confirmation-granted
-    value. A plain SHA-256 digest is fully computable by anyone who has this
-    source code and the action's own (public) fields - which means a caller
-    could self-issue "confirmations" for consequential actions without a human
-    ever approving them. Signing the digest with a server-held secret (HMAC)
-    means only this service can produce a valid token; a caller can only ever
-    replay a token that was actually returned to it after a real escalation.
-    Binding `run_id` into the signed payload also prevents a token minted for
-    one session from being replayed in a different one.
-    """
     payload = f"{run_id}:{action_digest(action)}".encode("utf-8")
     return hmac.new(_confirmation_secret(), payload, hashlib.sha256).hexdigest()[:24]
 
@@ -852,8 +816,6 @@ def _decide(request: DefenseRequest, trace_store: "TraceStore | None" = None) ->
         )
 
     if candidate.type == "request_confirmation":
-        # Asking for human confirmation is itself non-consequential; evaluate the target so
-        # a malicious agent cannot use confirmation as a substitute for policy enforcement.
         target = action
         target_result = _evaluate_tool_request(request, target, trace_store)
         if target_result[0] in {"block", "rewrite"}:
@@ -864,10 +826,6 @@ def _decide(request: DefenseRequest, trace_store: "TraceStore | None" = None) ->
             confidence=target_result[1].confidence,
             reason_codes=target_result[1].reason_codes or ["CONFIRMATION_REQUESTED"],
             explanation="The agent is requesting confirmation for the evaluated action.",
-            # NOTE: this token is a signed ticket (see confirmation_token), not a
-            # plain digest - a caller cannot compute it themselves. A real human
-            # confirmation step must occur before this exact string reappears in
-            # a future request's history_digest.confirmations_granted.
             metadata={
                 **target_result[1].metadata,
                 "confirmation_target": confirmation_token(target, request.run_id),
@@ -979,17 +937,6 @@ def _evaluate_memory_write(request: DefenseRequest, action: CandidateAction) -> 
 
 
 def _server_history(trace_store: "TraceStore | None", run_id: str) -> dict[str, Any]:
-    """Reconstruct history facts from the server's own trace log for this run_id.
-
-    `history_digest` in the request is supplied by the caller, so a caller that
-    under-reports (or zeroes out) blocked_count/escalated_count/steps_taken/
-    least_trusted_seen can silently defeat the long-horizon and adaptive-retry
-    checks below. The trace store already records every decision this service
-    has made for a run, including the source-trust rank it observed
-    (`metadata.source_trust_rank`), so it doubles as an independent, harder-to-
-    forge history source. Returns {} when unavailable so callers can fall back
-    to the client-reported digest alone.
-    """
     if trace_store is None or not run_id:
         return {}
     events = trace_store.recent(run_id)
@@ -1120,10 +1067,6 @@ def _evaluate_tool_request(
     if signal.secret_detected:
         signal.add("CREDENTIAL_LIKE_DATA", 0.30, "Credential-like data is present in the candidate action.")
     elif tool not in READ_ONLY_DOCUMENT_TOOLS and _looks_high_entropy_secret(arg_text):
-        # Lower-confidence signal: contributes to the general risk budget but,
-        # unlike secret_detected, does not trigger the hard-stop rules below -
-        # this covers credential formats our named patterns don't recognize
-        # without making every hash/ID/slug a hard block.
         signal.add("HIGH_ENTROPY_TOKEN", 0.12, "An unlabeled high-entropy token resembling a credential is present in the candidate action.")
 
     external_values = [] if tool in {"email_draft", "draft_email", "payment_prepare"} else _external_values(action, policy)
@@ -1140,16 +1083,6 @@ def _evaluate_tool_request(
     if signal.source_trust <= TRUST_RANK["untrusted_external"] and external_values:
         signal.add("LOW_TRUST_EXTERNAL_FLOW", 0.22, "The action combines low-trust source material with an external destination.")
 
-    # History-aware escalation for long-horizon/compositional behavior.
-    #
-    # blocked_count/escalated_count/steps_taken/least_trusted_seen below are
-    # reconciled with the server's own trace log rather than trusted outright:
-    # history_digest is caller-supplied, and a caller (or an attacker who
-    # controls the framework building the request) could under-report these to
-    # hide a prior pattern of denials or a low-trust source seen earlier in the
-    # run. Reconciliation takes the *more suspicious* of the two sources, so a
-    # caller can raise the client-reported values but not use them to suppress
-    # what the server already recorded.
     server_hist = _server_history(trace_store, request.run_id)
     effective_blocked = max(request.history_digest.blocked_count, server_hist.get("blocked_count", 0))
     effective_escalated = max(request.history_digest.escalated_count, server_hist.get("escalated_count", 0))
@@ -1186,17 +1119,14 @@ def _evaluate_tool_request(
     reported_confirmed = (token in granted or digest in granted)
 
     confirmed = reported_confirmed
-    # Reconcile confirmation against trace store if the server has prior records for this run
     if reported_confirmed and server_hist.get("has_prior_trace"):
         valid_targets = server_hist.get("escalated_targets", set())
-        # If the server has tracked escalations in this run and this target was never escalated:
         if server_hist.get("escalated_count", 0) > 0 and token not in valid_targets and digest not in valid_targets:
             signal.add("UNVERIFIED_CONFIRMATION_GRANT", 0.40, "Confirmation presented was not issued by prior escalation in this run.")
             confirmed = False
 
     requires_confirmation = _required_confirmation(tool, policy, action)
 
-    # Hard-stop rules: policy violations and dangerous data flows must not be bypassed by confirmation.
     if signal.secret_detected and external_values:
         rewrite = _build_safe_rewrite(action, policy)
         if rewrite is not None:
@@ -1313,15 +1243,9 @@ def _decision_from_signal(
 
 
 def decide(request: DefenseRequest, trace_store: "TraceStore | None" = None) -> DefenseDecision:
-    """Fail closed on an unexpected defense-engine error.
-
-    `trace_store`, when provided, lets history-aware checks be reconciled
-    against the server's own record of this run instead of trusting the
-    caller-reported history_digest alone (see _server_history).
-    """
     try:
         return _decide(request, trace_store)
-    except Exception as exc:  # defensive boundary: evaluator sees a valid response instead of a 500
+    except Exception:
         return DefenseDecision(
             decision="block",
             risk_score=1.0,
